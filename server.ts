@@ -34,8 +34,8 @@ import type {
   ServerMessage,
 } from './src/shared/types.ts';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const serverFile = fileURLToPath(import.meta.url);
+const serverDir = path.dirname(serverFile);
 
 interface ServerStickerRecord {
   sticker: StickerType;
@@ -2172,13 +2172,13 @@ export async function createGameServer({ development = false } = {}) {
     const vite = await createViteServer({ cacheDir: `.netlify/vite-${process.pid}`, server: { middlewareMode: true }, appType: 'spa' });
     app.use(vite.middlewares);
   } else {
-    app.use(express.static(path.join(__dirname, 'dist')));
+    app.use(express.static(path.join(serverDir, 'dist')));
     app.use((_req, res) => res.status(404).json({ error: 'Not found' }));
   }
   return server;
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {
+if (process.argv[1] && path.resolve(process.argv[1]) === serverFile) {
   const server = await createGameServer({ development: true });
   server.listen(Number(process.env.PORT) || 3000, '0.0.0.0');
 }
