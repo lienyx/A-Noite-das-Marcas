@@ -1,8 +1,6 @@
 import express from 'express';
 import { randomUUID, randomInt, createHash } from 'node:crypto';
-import { eq, sql } from 'drizzle-orm';
-import { db } from './db/index.ts';
-import { gameRooms } from './db/schema.ts';
+import { roomStore } from './roomStore.ts';
 import { cleanGameText, toDatabaseText } from './src/shared/text.ts';
 import http from 'http';
 import path from 'path';
@@ -117,7 +115,7 @@ interface RoomState {
   winHeadline: string | null;
 }
 
-// A hydrated cache of durable snapshots. Every change holds a database lock.
+// Cache das salas ativas. Os snapshots ficam no roomStore (memória do servidor).
 const rooms = new Map<string, RoomState>();
 type ClientContext = { roomCode: string | null; playerId: string | null };
 const clients = new Map<WebSocket, ClientContext>();
@@ -183,22 +181,19 @@ function runRoomOperation(code: string, action: (room: RoomState | undefined) =>
     socketsToReplace = new Set();
     const previousContexts = new Map([...clients].map(([socket, context]) => [socket, { ...context }]));
     try {
-      await db.transaction(async tx => {
-        await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${code}))`);
-        const [saved] = await tx.select().from(gameRooms).where(eq(gameRooms.code, code));
-        const room = saved ? hydrateRoom(code, saved.state) : undefined;
-        if (!saved) rooms.delete(code);
-        if (room && advance) advanceExpiredPhase(room);
-        action(room);
-        const current = rooms.get(code);
-        if (current) {
-          const snapshot = JSON.parse(JSON.stringify(current, (key, value) =>
-            key === 'ws' || key === 'phaseTimer' ? null : typeof value === 'string' ? toDatabaseText(value) : value
-          ));
-          await tx.insert(gameRooms).values({ code, state: snapshot, updatedAt: new Date() })
-            .onConflictDoUpdate({ target: gameRooms.code, set: { state: snapshot, updatedAt: new Date() } });
-        }
-      });
+      // Tudo acontece de forma sequencial (fila operationQueue), então não há corrida entre jogadores.
+      const saved = roomStore.load(code);
+      const room = saved ? hydrateRoom(code, saved.state) : undefined;
+      if (!saved) rooms.delete(code);
+      if (room && advance) advanceExpiredPhase(room);
+      action(room);
+      const current = rooms.get(code);
+      if (current) {
+        const snapshot = JSON.parse(JSON.stringify(current, (key, value) =>
+          key === 'ws' || key === 'phaseTimer' ? null : typeof value === 'string' ? toDatabaseText(value) : value
+        ));
+        roomStore.save({ code, state: snapshot, updatedAt: new Date() });
+      }
       // Closing another session cannot be rolled back: wait for a durable commit.
       for (const socket of socketsToReplace) {
         clients.delete(socket);
@@ -250,7 +245,7 @@ function generateRoomCode(): string {
   for (let i = 0; i < 4; i++) {
     code += chars[randomInt(chars.length)];
   }
-  return rooms.has(code) ? generateRoomCode() : code;
+  return rooms.has(code) || roomStore.has(code) ? generateRoomCode() : code;
 }
 
 function getMafiaSealLimit(room: RoomState): number {
@@ -2113,6 +2108,11 @@ export async function createGameServer({ development = false } = {}) {
   const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 8192 });
 
   app.get('/api/health', (_req, res) => res.json({ status: 'ok' }));
+  const pruneTimer = setInterval(() => {
+    roomStore.prune(code => [...clients.values()].some(context => context.roomCode === code));
+  }, 30 * 60 * 1000);
+  pruneTimer.unref();
+  server.on('close', () => clearInterval(pruneTimer));
   wss.on('connection', (ws, request) => {
     ws.on('error', () => {});
     // Same-origin browser connections only. Non-browser clients may omit Origin.
@@ -2141,7 +2141,7 @@ export async function createGameServer({ development = false } = {}) {
         if (!code) { sendToWs(ws, { type: 'ERROR', message: 'Entre em uma sala para jogar.' }); return; }
         void runRoomOperation(code, () => {
           if (ws.readyState !== WebSocket.OPEN) return;
-          // Context may have changed while this message waited for a database lock.
+          // Context may have changed while this message waited in the queue.
           if (msg.type === 'CREATE_ROOM' || msg.type === 'JOIN_ROOM') {
             if (context.roomCode) {
               sendToWs(ws, { type: 'ERROR', message: 'Saia da sala atual antes de entrar em outra.' }); return;
@@ -2169,16 +2169,20 @@ export async function createGameServer({ development = false } = {}) {
 
   if (development) {
     const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({ cacheDir: `.netlify/vite-${process.pid}`, server: { middlewareMode: true }, appType: 'spa' });
+    const vite = await createViteServer({ cacheDir: `node_modules/.vite-${process.pid}`, server: { middlewareMode: true }, appType: 'spa' });
     app.use(vite.middlewares);
   } else {
-    app.use(express.static(path.join(serverDir, 'dist')));
-    app.use((_req, res) => res.status(404).json({ error: 'Not found' }));
+    const distDir = path.join(serverDir, 'dist');
+    app.use(express.static(distDir));
+    app.use((req, res) => {
+      if (req.method === 'GET' && !req.path.startsWith('/api/')) res.sendFile(path.join(distDir, 'index.html'));
+      else res.status(404).json({ error: 'Not found' });
+    });
   }
   return server;
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === serverFile) {
-  const server = await createGameServer({ development: true });
+  const server = await createGameServer({ development: process.env.NODE_ENV !== 'production' });
   server.listen(Number(process.env.PORT) || 3000, '0.0.0.0');
 }
