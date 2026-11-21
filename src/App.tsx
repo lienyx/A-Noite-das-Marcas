@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { BookOpen, LogOut } from 'lucide-react';
 import { GameWorkspace } from './components/GameWorkspace';
@@ -7,12 +7,16 @@ import { LobbyScreen } from './components/LobbyScreen';
 import { NightZeroView } from './components/NightZeroView';
 import { PhaseTransitionOverlay } from './components/PhaseTransitionOverlay';
 import { RulesModal } from './components/RulesModal';
+import { BrandMark } from './components/BrandMark';
 import { useGameSocket } from './hooks/useGameSocket';
 
 export default function App() {
-  const { connected, roomState, errorMsg, toastMsg, sendAction, leaveSession } =
+  const { connected, pending, roomState, errorMsg, toastMsg, sendAction, leaveSession } =
     useGameSocket();
   const [rulesOpen, setRulesOpen] = useState(false);
+  const [rulesTab, setRulesTab] = useState<'regras' | 'papeis'>('regras');
+  const closeRules = useCallback(() => setRulesOpen(false), []);
+  const openRules = (tab: 'regras' | 'papeis' = 'regras') => { setRulesTab(tab); setRulesOpen(true); };
   const [initialRoomCode, setInitialRoomCode] = useState('');
   const [secondsLeft, setSecondsLeft] = useState<number | null>(null);
 
@@ -59,12 +63,14 @@ export default function App() {
       return (
         <HomeScreen
           connected={connected}
+          pending={pending}
           initialRoomCode={initialRoomCode}
           onCreateRoom={(name) => sendAction({ type: 'CREATE_ROOM', name })}
           onJoinRoom={(roomCode, name) =>
             sendAction({ type: 'JOIN_ROOM', roomCode, name })
           }
-          onOpenRules={() => setRulesOpen(true)}
+          onOpenRules={() => openRules()}
+          onOpenRoles={() => openRules('papeis')}
         />
       );
     }
@@ -74,14 +80,12 @@ export default function App() {
     if (publicState.phase === 'LOBBY') {
       return (
         <div className="min-h-screen flex flex-col">
-          <header className="sticky top-0 z-30 h-13 border-b border-white/10 bg-[#0C0E14]/95 backdrop-blur-md px-4 sm:px-6 flex items-center justify-between gap-4">
-            <span className="font-display text-base font-bold text-[#F5EBD6] truncate">
-              A Noite das Marcas
-            </span>
+          <header className="session-header sticky top-0 z-30 h-13 border-b border-white/10 bg-[#0C0E14]/95 backdrop-blur-md px-4 sm:px-6 flex items-center justify-between gap-4">
+            <a href="/" onClick={(event) => event.preventDefault()} className="brand"><BrandMark /><span>A NOITE<span>DAS MARCAS</span></span></a>
             <div className="flex items-center gap-2 shrink-0">
               <button
                 type="button"
-                onClick={() => setRulesOpen(true)}
+                onClick={() => openRules()}
                 className="min-h-[40px] inline-flex items-center gap-1.5 rounded-lg border border-white/10 px-3 py-1.5 text-xs font-medium text-[#D6CFC2] hover:text-white whitespace-nowrap"
               >
                 <BookOpen className="w-4 h-4 text-[#D99B26]" />
@@ -110,13 +114,13 @@ export default function App() {
     if (publicState.phase === 'NOITE_ZERO') {
       return (
         <div className="min-h-screen flex flex-col">
-          <header className="sticky top-0 z-30 h-13 border-b border-white/10 bg-[#0C0E14]/95 backdrop-blur-md px-4 sm:px-6 flex items-center justify-between gap-4">
+          <header className="session-header sticky top-0 z-30 h-13 border-b border-white/10 bg-[#0C0E14]/95 backdrop-blur-md px-4 sm:px-6 flex items-center justify-between gap-4">
             <span className="font-display text-base font-bold text-[#F5EBD6] truncate">
               Noite Zero · Sala {publicState.roomCode}
             </span>
             <button
               type="button"
-              onClick={() => setRulesOpen(true)}
+              onClick={() => openRules()}
               className="min-h-[40px] inline-flex items-center gap-1.5 rounded-lg border border-white/10 px-3 py-1.5 text-xs font-medium text-[#D6CFC2] hover:text-white whitespace-nowrap"
             >
               <BookOpen className="w-4 h-4 text-[#D99B26]" />
@@ -139,7 +143,7 @@ export default function App() {
         privateState={privateState}
         secondsLeft={secondsLeft}
         onAction={sendAction}
-        onOpenRules={() => setRulesOpen(true)}
+        onOpenRules={() => openRules()}
         onLeave={leaveSession}
       />
     );
@@ -147,7 +151,7 @@ export default function App() {
 
   return (
     <div
-      className={`min-h-screen text-[#F1EDE4] transition-colors duration-700 ${
+      className={`game-shell min-h-screen text-[#F1EDE4] transition-colors duration-700 ${
         isDaylightPhase
           ? 'bg-[#15130F] bg-[radial-gradient(ellipse_at_top,rgba(217,155,38,0.12),transparent_60%)]'
           : isDuskPhase
@@ -158,11 +162,12 @@ export default function App() {
       <AnimatePresence mode="wait">
         <motion.div
           key={screenKey}
-          initial={{ opacity: 0, filter: 'blur(6px)' }}
-          animate={{ opacity: 1, filter: 'blur(0px)' }}
-          exit={{ opacity: 0, filter: 'blur(6px)' }}
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
           transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
         >
+          {roomState && !connected && <div className="session-banner" role="status">A conexão foi interrompida. Reconectando à sua partida…</div>}
           {renderContent()}
         </motion.div>
       </AnimatePresence>
@@ -172,19 +177,19 @@ export default function App() {
       {(errorMsg || toastMsg) && (
         <div className="fixed top-16 left-1/2 -translate-x-1/2 z-50 w-[92%] max-w-md pointer-events-none">
           {errorMsg && (
-            <div className="rounded-xl border border-[#C83232]/60 bg-[#1F1215]/95 px-4 py-3 text-xs font-semibold text-[#FCA5A5] shadow-xl">
+            <div role="alert" className="rounded-xl border border-[#C83232]/60 bg-[#1F1215]/95 px-4 py-3 text-xs font-semibold text-[#FCA5A5] shadow-xl">
               {errorMsg}
             </div>
           )}
           {toastMsg && !errorMsg && (
-            <div className="rounded-xl border border-[#D99B26]/50 bg-[#181A22]/95 px-4 py-3 text-xs font-semibold text-[#FCD34D] shadow-xl">
+            <div role="status" className="rounded-xl border border-[#D99B26]/50 bg-[#181A22]/95 px-4 py-3 text-xs font-semibold text-[#FCD34D] shadow-xl">
               {toastMsg}
             </div>
           )}
         </div>
       )}
 
-      <RulesModal open={rulesOpen} onClose={() => setRulesOpen(false)} />
+      <RulesModal initialTab={rulesTab} open={rulesOpen} onClose={closeRules} />
     </div>
   );
 }

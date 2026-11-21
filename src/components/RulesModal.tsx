@@ -1,36 +1,62 @@
-import { useState } from 'react';
-import { X } from 'lucide-react';
+import { useEffect, useRef, useState } from 'react';
+import { BookOpen, Download, Search, X } from 'lucide-react';
 import { ALL_ROLE_IDS, ROLES, type Faction } from '../shared/gameData';
 import { RoleIcon, getFactionMeta } from './RoleIcon';
 
 export function RulesModal({
   open,
   onClose,
+  initialTab = 'regras',
 }: {
+  initialTab?: 'regras' | 'papeis';
   open: boolean;
   onClose: () => void;
 }) {
   const [tab, setTab] = useState<'regras' | 'papeis'>('regras');
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const [search, setSearch] = useState('');
   const [factionFilter, setFactionFilter] = useState<'ALL' | Faction>('ALL');
+
+  useEffect(() => {
+    if (!open) return;
+    setTab(initialTab);
+    const previous = document.activeElement as HTMLElement | null;
+    const overflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    dialogRef.current?.querySelector<HTMLButtonElement>('button')?.focus();
+    const handleKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose();
+      if (event.key !== 'Tab') return;
+      const items = dialogRef.current?.querySelectorAll<HTMLElement>('button:not(:disabled), a[href], input');
+      if (!items?.length) return;
+      const first = items[0]; const last = items[items.length - 1];
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+    };
+    document.addEventListener('keydown', handleKey);
+    return () => { document.body.style.overflow = overflow; document.removeEventListener('keydown', handleKey); previous?.focus(); };
+  }, [open, initialTab, onClose]);
 
   if (!open) return null;
 
   const filteredRoles = ALL_ROLE_IDS.filter((id) => {
-    if (factionFilter === 'ALL') return true;
-    return ROLES[id].faction === factionFilter;
+    const normalize = (text: string) => text.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+    return (factionFilter === 'ALL' || ROLES[id].faction === factionFilter) && normalize(ROLES[id].name).includes(normalize(search));
   });
 
   return (
     <div
       className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/75 backdrop-blur-sm p-0 sm:p-4"
+      onClick={(event) => { if (event.target === event.currentTarget) onClose(); }}
       role="dialog"
+      ref={dialogRef}
       aria-modal="true"
-      aria-label="Regras e Papéis"
+      aria-labelledby="rules-title"
     >
       <div className="flex max-h-[90vh] w-full max-w-2xl flex-col rounded-t-3xl sm:rounded-2xl border border-white/10 bg-[#12151E] shadow-2xl">
         <div className="flex items-center justify-between border-b border-white/10 px-5 py-4">
-          <h2 className="font-display text-lg font-bold text-[#F5EBD6]">
-            Livro de Regras e Papéis
+          <h2 id="rules-title" className="font-display text-2xl font-bold text-[#F5EBD6]">
+            O livro da cidade
           </h2>
           <button
             type="button"
@@ -42,9 +68,10 @@ export function RulesModal({
           </button>
         </div>
 
-        <div className="border-b border-white/10 px-5 py-2.5 flex items-center gap-2">
+        <div className="border-b border-white/10 px-5 py-2.5 flex items-center gap-2" role="tablist" aria-label="Livro da cidade">
           <button
             type="button"
+            role="tab" aria-selected={tab === 'regras'}
             onClick={() => setTab('regras')}
             className={`min-h-[40px] rounded-lg px-4 py-1.5 text-xs font-semibold transition-colors whitespace-nowrap ${
               tab === 'regras'
@@ -56,6 +83,7 @@ export function RulesModal({
           </button>
           <button
             type="button"
+            role="tab" aria-selected={tab === 'papeis'}
             onClick={() => setTab('papeis')}
             className={`min-h-[40px] rounded-lg px-4 py-1.5 text-xs font-semibold transition-colors whitespace-nowrap ${
               tab === 'papeis'
@@ -67,9 +95,10 @@ export function RulesModal({
           </button>
         </div>
 
-        <div className="flex-1 overflow-y-auto p-5 space-y-5 text-sm text-[#D6CFC2]">
+        <div className="min-h-0 flex-1 overflow-y-auto p-5 space-y-5 text-sm text-[#D6CFC2]">
           {tab === 'regras' ? (
             <div className="space-y-5">
+              <p className="text-xs leading-relaxed text-[#A8A095]">Adaptação digital do jogo presencial: o servidor distribui os pergaminhos, resolve as ações e conduz as fases. Reúna de 4 a 20 amigos; o baralho original foi pensado para 13 a 15.</p>
               <section className="space-y-2">
                 <h3 className="font-display text-base font-bold text-[#F5EBD6]">
                   Todos jogam, ninguém narra
@@ -133,6 +162,7 @@ export function RulesModal({
             </div>
           ) : (
             <div className="space-y-4">
+              <label className="flex items-center gap-2 rounded-lg border border-white/15 bg-[#161922] px-3 py-2"><Search size={16} /><span className="sr-only">Buscar papel</span><input type="search" value={search} onChange={event => setSearch(event.target.value)} placeholder="Buscar um papel…" className="w-full min-h-7 bg-transparent text-sm outline-none" /></label>
               <div className="flex flex-wrap gap-1.5">
                 {(
                   [
@@ -160,6 +190,7 @@ export function RulesModal({
               </div>
 
               <div className="space-y-2.5">
+                {filteredRoles.length === 0 && <p className="py-8 text-center text-sm text-[#A8A095]">Nenhum papel encontrado. Experimente outro nome ou categoria.</p>}
                 {filteredRoles.map((id) => {
                   const r = ROLES[id];
                   const f = getFactionMeta(r.faction);
@@ -193,6 +224,7 @@ export function RulesModal({
             </div>
           )}
         </div>
+        <a href="/assets/aistudio/noite-das-marcas-town-of-salem_0cc06509.pdf" target="_blank" rel="noreferrer" className="flex items-center justify-between gap-3 border-t border-white/10 px-5 py-4 text-xs text-[#CDAE7E]"><span className="inline-flex items-center gap-2"><BookOpen size={15} /> Consultar o PDF original</span><Download size={15} /></a>
       </div>
     </div>
   );
