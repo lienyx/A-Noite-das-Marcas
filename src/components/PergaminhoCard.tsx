@@ -29,6 +29,12 @@ export function PergaminhoCard({
     return () => clearTimeout(t);
   }, [revealed]);
 
+  useEffect(() => {
+    const conceal = () => { if (document.hidden) { setRevealed(false); setFoldMode('full'); } };
+    document.addEventListener('visibilitychange', conceal);
+    return () => document.removeEventListener('visibilitychange', conceal);
+  }, []);
+
   const role = privateState.roleId ? ROLES[privateState.roleId] : null;
   if (!role) {
     return (

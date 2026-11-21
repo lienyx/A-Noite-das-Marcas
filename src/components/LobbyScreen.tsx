@@ -12,6 +12,7 @@ import {
   Shuffle,
   SlidersHorizontal,
   Users,
+  UserMinus,
 } from 'lucide-react';
 import {
   ALL_ROLE_IDS,
@@ -37,6 +38,7 @@ export function LobbyScreen({
   const isHost = Boolean(me?.isHost);
   const [showQr, setShowQr] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [copyError, setCopyError] = useState(false);
 
   const shareUrl = useMemo(() => {
     if (typeof window === 'undefined') return '';
@@ -47,9 +49,11 @@ export function LobbyScreen({
     try {
       await navigator.clipboard.writeText(shareUrl);
       setCopied(true);
+      setCopyError(false);
       setTimeout(() => setCopied(false), 2000);
     } catch {
-      // ignore
+      setCopyError(true);
+      setShowQr(true);
     }
   };
 
@@ -82,6 +86,7 @@ export function LobbyScreen({
 
   return (
     <div className="max-w-6xl mx-auto px-4 py-5 pb-28 sm:px-6 space-y-6">
+      <section className="lobby-intro"><p className="eyebrow">A CIDADE COMEÇA A SE REUNIR</p><h1>Preparem seus álibis.</h1><p>{isHost ? 'Convide seus amigos, escolha o baralho e ajuste o ritmo da noite. Quando todos chegarem, os segredos serão distribuídos.' : 'Você já tem um lugar na cidade. Enquanto os outros chegam, conheça os papéis e prepare sua melhor história.'}</p></section>
       {/* Invite banner */}
       <section className="rounded-2xl border border-white/10 bg-[#161922] p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div className="space-y-1">
@@ -91,7 +96,7 @@ export function LobbyScreen({
               {publicState.roomCode}
             </span>
             <span className="text-xs text-[#A8A095]">
-              {publicState.players.length} convidado(s) conectado(s)
+              {publicState.players.filter(p => p.connected).length} de {publicState.players.length} na cidade
             </span>
           </div>
         </div>
@@ -116,6 +121,7 @@ export function LobbyScreen({
         </div>
       </section>
 
+      {copyError && <p role="status" className="text-xs text-[#CDAE7E]">Não foi possível copiar automaticamente. Compartilhe o código acima ou use o QR Code.</p>}
       {showQr && shareUrl && (
         <section className="rounded-2xl border border-[#D99B26]/30 bg-[#161922] p-6 flex flex-col items-center gap-3 text-center">
           <div className="rounded-xl bg-white p-3">
@@ -134,7 +140,7 @@ export function LobbyScreen({
             <div className="flex items-center gap-2">
               <Users className="w-4 h-4 text-[#D99B26]" />
               <h2 className="font-display text-base font-bold text-[#F5EBD6]">
-                Círculo do Sorteio
+                Quem está na cidade
               </h2>
             </div>
             {isHost && (
@@ -152,6 +158,7 @@ export function LobbyScreen({
             A ordem da lista define quem está à direita (protegido do Anjo) e à esquerda (alvo do Carrasco).
           </p>
 
+          <div className="lobby-progress"><span>{publicState.players.length < 4 ? `Faltam ${4 - publicState.players.length} para começar` : 'A cidade está pronta para jogar'}</span><div className="lobby-progress-track"><span style={{ transform: `scaleX(${Math.min(1, publicState.players.length / 4)})` }} /></div></div>
           <ul className="divide-y divide-white/10">
             {publicState.players.map((p, index) => (
               <li key={p.id} className="flex items-center justify-between gap-2 py-2.5">
@@ -174,6 +181,7 @@ export function LobbyScreen({
 
                 {isHost && (
                   <div className="flex items-center gap-1 shrink-0">
+                    {!p.connected && <button type="button" onClick={() => onAction({ type: 'KICK_PLAYER', playerId: p.id })} aria-label={`Remover ${p.name} da sala`} title="Remover convidado desconectado" className="min-h-[40px] min-w-[40px] flex items-center justify-center rounded-lg border border-white/10 text-[#CDAE7E]"><UserMinus size={15} /></button>}
                     <button
                       type="button"
                       disabled={index === 0}
@@ -205,7 +213,7 @@ export function LobbyScreen({
             <div className="flex items-center gap-2">
               <SlidersHorizontal className="w-4 h-4 text-[#D99B26]" />
               <h2 className="font-display text-base font-bold text-[#F5EBD6]">
-                Montando o Baralho e Ritmo
+                O ritmo da noite
               </h2>
             </div>
 
@@ -240,9 +248,10 @@ export function LobbyScreen({
             {/* Timers & Pace */}
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
               <div className="space-y-1.5">
-                <label className="block text-[#A8A095]">Tempo da Caçada</label>
+                <label htmlFor="hunt-duration" className="block text-[#A8A095]">Tempo da Caçada</label>
                 <select
                   disabled={!isHost}
+                  id="hunt-duration"
                   value={publicState.cacadaMinutes}
                   onChange={(e) =>
                     onAction({
@@ -262,9 +271,10 @@ export function LobbyScreen({
               </div>
 
               <div className="space-y-1.5">
-                <label className="block text-[#A8A095]">Tempo do Tribunal</label>
+                <label htmlFor="trial-duration" className="block text-[#A8A095]">Tempo do Tribunal</label>
                 <select
                   disabled={!isHost}
+                  id="trial-duration"
                   value={publicState.tribunalMinutes}
                   onChange={(e) =>
                     onAction({
@@ -286,6 +296,7 @@ export function LobbyScreen({
                 <label className="block text-[#A8A095]">Ritmo de Selos</label>
                 <select
                   disabled={!isHost}
+                  aria-label="Ritmo dos matadores"
                   value={publicState.killerPace}
                   onChange={(e) =>
                     onAction({
@@ -357,6 +368,7 @@ export function LobbyScreen({
                       <div className="flex items-center gap-1.5 shrink-0">
                         <button
                           type="button"
+                          aria-label={`Remover ${r.name} do baralho`}
                           onClick={() => adjustFreeRole(id, -1)}
                           disabled={count === 0}
                           className="min-h-[36px] min-w-[36px] flex items-center justify-center rounded-lg border border-white/10 text-[#D6CFC2] disabled:opacity-30"
@@ -368,6 +380,7 @@ export function LobbyScreen({
                         </span>
                         <button
                           type="button"
+                          aria-label={`Adicionar ${r.name} ao baralho`}
                           onClick={() => adjustFreeRole(id, 1)}
                           disabled={count >= r.maxCopies}
                           className="min-h-[36px] min-w-[36px] flex items-center justify-center rounded-lg border border-white/10 text-[#D6CFC2] disabled:opacity-30"
@@ -414,7 +427,7 @@ export function LobbyScreen({
             <button
               type="button"
               disabled={
-                publicState.players.length < 4 ||
+                publicState.players.length < 4 || publicState.players.some(p => !p.connected) ||
                 publicState.publicRoleList.length !== publicState.players.length
               }
               onClick={() => onAction({ type: 'START_GAME' })}

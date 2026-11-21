@@ -111,7 +111,7 @@ export function GameWorkspace({
     const list: Array<{ id: typeof activeChannel; label: string }> = [
       { id: 'TRIBUNAL', label: 'Tribunal' },
     ];
-    if (isMafia) list.push({ id: 'MAFIA', label: 'Máfia' });
+    if (isMafia && isAlive) list.push({ id: 'MAFIA', label: 'Máfia' });
     if (privateState.roleId === 'medium' || !isAlive) {
       list.push({ id: 'MEDIUM', label: 'Médium' });
     }
@@ -172,13 +172,13 @@ export function GameWorkspace({
   }, [activeChannel, privateState]);
 
   const canSendInActiveChannel = useMemo(() => {
-    if (activeChannel === 'TRIBUNAL') return isAlive && !me?.silenced;
-    if (activeChannel === 'MAFIA') return isMafia;
+    if (activeChannel === 'TRIBUNAL') return publicState.phase === 'TRIBUNAL' && !publicState.pendingJesterId && isAlive && !me?.silenced;
+    if (activeChannel === 'MAFIA') return isMafia && isAlive;
     if (activeChannel === 'MEDIUM') return privateState.roleId === 'medium' || !isAlive;
     if (activeChannel === 'GHOSTS') return !isAlive;
     if (activeChannel === 'DUNGEON') return isDungeonParticipant;
     return false;
-  }, [activeChannel, isAlive, me?.silenced, isMafia, privateState.roleId, isDungeonParticipant]);
+  }, [activeChannel, isAlive, me?.silenced, isMafia, privateState.roleId, isDungeonParticipant, publicState.phase, publicState.pendingJesterId]);
 
   const handleSendChat = (e: React.FormEvent) => {
     e.preventDefault();

@@ -2,151 +2,153 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ClientActionMessage, RoomSyncPayload, ServerMessage } from '../shared/types';
 import { playBellSound } from '../utils/sound';
 
-function getOrCreateToken(): string {
+type Session = { roomCode: string; name: string };
+function readSession(): Session | null {
   try {
-    const existing = localStorage.getItem('ndm_player_token');
+    const value = JSON.parse(sessionStorage.getItem('ndm_last_session') ?? 'null');
+    return value && typeof value.roomCode === 'string' && typeof value.name === 'string' ? value : null;
+  } catch { return null; }
+}
+function playerToken() {
+  try {
+    const existing = sessionStorage.getItem('ndm_player_token');
     if (existing) return existing;
-    const created = `tok_${Math.random().toString(36).slice(2, 12)}_${Date.now().toString(36)}`;
-    localStorage.setItem('ndm_player_token', created);
-    return created;
-  } catch {
-    return `tok_${Math.random().toString(36).slice(2, 12)}`;
-  }
+    const token = crypto.randomUUID();
+    sessionStorage.setItem('ndm_player_token', token);
+    return token;
+  } catch { return crypto.randomUUID(); }
 }
 
 export function useGameSocket() {
   const [connected, setConnected] = useState(false);
+  const [pending, setPending] = useState(false);
   const [roomState, setRoomState] = useState<RoomSyncPayload | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [toastMsg, setToastMsg] = useState<string | null>(null);
-
   const wsRef = useRef<WebSocket | null>(null);
-  const tokenRef = useRef<string>(getOrCreateToken());
-  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const lastRoomRef = useRef<{ roomCode: string; name: string } | null>(null);
-
-  useEffect(() => {
-    try {
-      const saved = localStorage.getItem('ndm_last_session');
-      if (saved) {
-        const parsed = JSON.parse(saved) as { roomCode: string; name: string };
-        if (parsed.roomCode && parsed.name) {
-          lastRoomRef.current = parsed;
-        }
-      }
-    } catch {
-      // ignore
-    }
+  const tokenRef = useRef<string | null>(null);
+  if (!tokenRef.current) tokenRef.current = playerToken();
+  const sessionRef = useRef<Session | null>(readSession());
+  const clearSession = useCallback(() => {
+    sessionRef.current = null;
+    try { sessionStorage.removeItem('ndm_last_session'); } catch { /* Storage may be disabled. */ }
+    setRoomState(null);
+    setPending(false);
   }, []);
 
-  const connect = useCallback(() => {
-    if (wsRef.current && (wsRef.current.readyState === WebSocket.OPEN || wsRef.current.readyState === WebSocket.CONNECTING)) {
-      return;
-    }
-
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const url = `${protocol}//${window.location.host}/ws`;
-    const ws = new WebSocket(url);
-    wsRef.current = ws;
-
-    ws.onopen = () => {
-      setConnected(true);
-      setErrorMsg(null);
-      if (lastRoomRef.current) {
-        ws.send(
-          JSON.stringify({
-            type: 'JOIN_ROOM',
-            roomCode: lastRoomRef.current.roomCode,
-            name: lastRoomRef.current.name,
-            playerToken: tokenRef.current,
-          } satisfies ClientActionMessage)
-        );
-      }
-    };
-
-    ws.onmessage = (event) => {
-      try {
-        const msg = JSON.parse(event.data) as ServerMessage;
-        if (msg.type === 'SYNC') {
-          setRoomState(msg.payload);
-          const me = msg.payload.publicState.players.find(
-            (p) => p.id === msg.payload.privateState.playerId
-          );
-          if (me) {
-            const session = {
-              roomCode: msg.payload.publicState.roomCode,
-              name: me.name,
-            };
-            lastRoomRef.current = session;
-            try {
-              localStorage.setItem('ndm_last_session', JSON.stringify(session));
-            } catch {
-              // ignore
+  useEffect(() => {
+    let disposed = false;
+    let attempt = 0;
+    let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+    let lastMessageAt = Date.now();
+    const connect = () => {
+      if (disposed) return;
+      const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const socket = new WebSocket(`${protocol}//${location.host}/ws`);
+      wsRef.current = socket;
+      socket.onopen = () => {
+        if (disposed) { socket.close(); return; }
+        attempt = 0;
+        lastMessageAt = Date.now();
+        setConnected(true);
+        setErrorMsg(null);
+        if (sessionRef.current) socket.send(JSON.stringify({ type: 'JOIN_ROOM', ...sessionRef.current, playerToken: tokenRef.current }));
+      };
+      socket.onmessage = event => {
+        if (disposed) return;
+        lastMessageAt = Date.now();
+        try {
+          const message = JSON.parse(event.data) as ServerMessage;
+          if (message.type === 'SYNC') {
+            setRoomState(message.payload);
+            setPending(false);
+            setErrorMsg(null);
+            const me = message.payload.publicState.players.find(p => p.id === message.payload.privateState.playerId);
+            if (me) {
+              sessionRef.current = { roomCode: message.payload.publicState.roomCode, name: me.name };
+              try { sessionStorage.setItem('ndm_last_session', JSON.stringify(sessionRef.current)); } catch { /* Optional session recovery. */ }
             }
-          }
-        } else if (msg.type === 'ERROR') {
-          setErrorMsg(msg.message);
-          setTimeout(() => setErrorMsg((cur) => (cur === msg.message ? null : cur)), 4000);
-        } else if (msg.type === 'TOAST') {
-          setToastMsg(msg.message);
-          setTimeout(() => setToastMsg((cur) => (cur === msg.message ? null : cur)), 4000);
-        } else if (msg.type === 'BELL_SOUND') {
-          playBellSound(msg.reason);
+          } else if (message.type === 'LEFT') {
+            clearSession();
+          } else if (message.type === 'ERROR') {
+            setPending(false);
+            setErrorMsg(message.message);
+            if (/não encontrada|removido da sala/.test(message.message)) clearSession();
+          } else if (message.type === 'TOAST') {
+            setToastMsg(message.message);
+          } else if (message.type === 'BELL_SOUND') playBellSound(message.reason);
+        } catch { /* Ignore a malformed server frame and keep the connection. */ }
+      };
+      socket.onerror = () => { /* onclose handles recovery. */ };
+      socket.onclose = event => {
+        if (disposed) return;
+        wsRef.current = null;
+        setConnected(false);
+        setPending(false);
+        if (event.code === 4001) {
+          clearSession();
+          setErrorMsg('Esta sessão foi aberta em outra janela. Recarregue para continuar.');
+          return;
         }
-      } catch {
-        // ignore parse errors
-      }
+        reconnectTimer = setTimeout(connect, Math.min(20_000, 800 * 2 ** attempt++) + Math.random() * 400);
+      };
     };
-
-    ws.onclose = () => {
-      setConnected(false);
+    connect();
+    // Also refreshes players connected to another server instance and resumes expired phases.
+    const heartbeat = setInterval(() => {
+      const socket = wsRef.current;
+      if (socket?.readyState !== WebSocket.OPEN || !sessionRef.current) return;
+      if (Date.now() - lastMessageAt > 30_000) { socket.close(); return; }
+      socket.send(JSON.stringify({ type: 'SYNC_REQUEST' }));
+    }, 6000);
+    const onVisible = () => {
+      if (document.visibilityState !== 'visible') return;
+      const socket = wsRef.current;
+      if (socket?.readyState === WebSocket.OPEN && sessionRef.current) socket.send(JSON.stringify({ type: 'SYNC_REQUEST' }));
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      disposed = true;
+      clearInterval(heartbeat);
+      clearTimeout(reconnectTimer);
+      document.removeEventListener('visibilitychange', onVisible);
+      wsRef.current?.close();
       wsRef.current = null;
-      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
-      reconnectTimerRef.current = setTimeout(() => {
-        connect();
-      }, 1500);
     };
-  }, []);
+  }, [clearSession]);
 
   useEffect(() => {
-    connect();
-    return () => {
-      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
-      wsRef.current?.close();
-    };
-  }, [connect]);
+    if (!pending) return;
+    const timer = setTimeout(() => { setPending(false); setErrorMsg('A cidade demorou a responder. Confira sua conexão e tente novamente.'); }, 20_000);
+    return () => clearTimeout(timer);
+  }, [pending]);
+  useEffect(() => {
+    if (!errorMsg) return;
+    const timer = setTimeout(() => setErrorMsg(null), 8000);
+    return () => clearTimeout(timer);
+  }, [errorMsg]);
+  useEffect(() => {
+    if (!toastMsg) return;
+    const timer = setTimeout(() => setToastMsg(null), 4500);
+    return () => clearTimeout(timer);
+  }, [toastMsg]);
 
   const sendAction = useCallback((action: ClientActionMessage) => {
-    const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      setErrorMsg('Reconectando ao servidor...');
-      return;
-    }
+    const socket = wsRef.current;
+    if (socket?.readyState !== WebSocket.OPEN) { setErrorMsg('Reconectando à cidade. Aguarde um instante.'); return; }
     if (action.type === 'CREATE_ROOM' || action.type === 'JOIN_ROOM') {
-      ws.send(JSON.stringify({ ...action, playerToken: tokenRef.current }));
-    } else {
-      ws.send(JSON.stringify(action));
-    }
+      setPending(true);
+      setErrorMsg(null);
+      socket.send(JSON.stringify({ ...action, playerToken: tokenRef.current }));
+    } else socket.send(JSON.stringify(action));
   }, []);
-
   const leaveSession = useCallback(() => {
-    lastRoomRef.current = null;
-    try {
-      localStorage.removeItem('ndm_last_session');
-    } catch {
-      // ignore
-    }
-    setRoomState(null);
-    wsRef.current?.close();
-  }, []);
+    if (wsRef.current?.readyState === WebSocket.OPEN) sendAction({ type: 'LEAVE_ROOM' });
+    else clearSession();
+    const url = new URL(location.href);
+    url.searchParams.delete('room');
+    history.replaceState(null, '', url);
+  }, [clearSession, sendAction]);
 
-  return {
-    connected,
-    roomState,
-    errorMsg,
-    toastMsg,
-    clearError: () => setErrorMsg(null),
-    sendAction,
-    leaveSession,
-  };
+  return { connected, pending, roomState, errorMsg, toastMsg, sendAction, leaveSession };
 }

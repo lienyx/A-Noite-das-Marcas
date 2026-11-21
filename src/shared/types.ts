@@ -65,6 +65,7 @@ export interface DuelState {
   lastRoundSummary: string | null;
   winnerId: string | null;
   finished: boolean;
+  finishedAt?: number;
 }
 
 export interface PublicGameState {
@@ -147,6 +148,9 @@ export interface RoomSyncPayload {
 }
 
 export type ClientActionMessage =
+  | { type: 'SYNC_REQUEST' }
+  | { type: 'LEAVE_ROOM' }
+  | { type: 'KICK_PLAYER'; playerId: string }
   | { type: 'JOIN_ROOM'; roomCode: string; name: string; playerToken?: string }
   | { type: 'CREATE_ROOM'; name: string; playerToken?: string }
   | { type: 'REORDER_SEAT'; playerId: string; direction: 'up' | 'down' }
@@ -185,6 +189,7 @@ export type ClientActionMessage =
   | { type: 'PLAY_AGAIN' };
 
 export type ServerMessage =
+  | { type: 'LEFT' }
   | { type: 'SYNC'; payload: RoomSyncPayload }
   | { type: 'ERROR'; message: string }
   | { type: 'BELL_SOUND'; reason: 'badalada' | 'noite_zero' | 'tribunal' | 'duel' | 'victory' }

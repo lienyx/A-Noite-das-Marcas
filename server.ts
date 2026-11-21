@@ -1,7 +1,11 @@
 import express from 'express';
+import { randomUUID, randomInt, createHash } from 'node:crypto';
+import { eq, sql } from 'drizzle-orm';
+import { db } from './db/index.ts';
+import { gameRooms } from './db/schema.ts';
+import { cleanGameText, toDatabaseText } from './src/shared/text.ts';
 import http from 'http';
 import path from 'path';
-import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { WebSocketServer, WebSocket } from 'ws';
 import {
@@ -45,6 +49,7 @@ interface ServerPlayer {
   name: string;
   seatIndex: number;
   connected: boolean;
+  lastSeenAt: number;
   isHost: boolean;
   alive: boolean;
   deathCause: DeathCause | null;
@@ -112,17 +117,138 @@ interface RoomState {
   winHeadline: string | null;
 }
 
+// A hydrated cache of durable snapshots. Every change holds a database lock.
 const rooms = new Map<string, RoomState>();
+type ClientContext = { roomCode: string | null; playerId: string | null };
+const clients = new Map<WebSocket, ClientContext>();
+let operationQueue: Promise<void> = Promise.resolve();
+let outbox: Array<{ ws: WebSocket | null; message: ServerMessage }> | null = null;
+let changedRooms = new Set<string>();
+let socketsToReplace = new Set<WebSocket>();
+
+function scheduleRoomTimer(room: RoomState, callback: () => void, duration: number) {
+  const phase = room.phase;
+  const deadline = room.phaseEndsAt;
+  const timer = setTimeout(() => {
+    void runRoomOperation(room.roomCode, (current) => {
+      if (current && current.phase === phase && current.phaseEndsAt === deadline) callback();
+    }, undefined, false);
+  }, duration);
+  timer.unref();
+  return timer;
+}
+
+function hydrateRoom(code: string, state: unknown): RoomState {
+  const restored = state as RoomState;
+  const room = rooms.get(code) ?? restored;
+  if (room.phaseTimer) clearTimeout(room.phaseTimer);
+  Object.assign(room, restored, { phaseTimer: null });
+  if (room.activeDuel?.finished && Date.now() - (room.activeDuel.finishedAt ?? 0) >= 4000) {
+    room.activeDuel = null;
+    changedRooms.add(code);
+  }
+  for (const player of room.players) {
+    player.ws = [...clients].find(([socket, context]) =>
+      context.roomCode === code && context.playerId === player.id && socket.readyState === WebSocket.OPEN
+    )?.[0] ?? null;
+    player.connected = Boolean(player.ws) || (player.connected && Date.now() - (player.lastSeenAt ?? 0) < 30_000);
+  }
+  const host = room.players.find(player => player.isHost);
+  if (host && !host.connected && Date.now() - (host.lastSeenAt ?? 0) > 30_000) {
+    const nextHost = room.players.find(player => player.connected);
+    if (nextHost) { host.isHost = false; nextHost.isHost = true; }
+  }
+  rooms.set(code, room);
+  if (room.phaseEndsAt) room.phaseTimer = scheduleRoomTimer(room, () => advanceExpiredPhase(room), Math.max(0, room.phaseEndsAt - Date.now()));
+  return room;
+}
+
+function advanceExpiredPhase(room: RoomState): void {
+  if (!room.phaseEndsAt || room.phaseEndsAt > Date.now()) return;
+  if (room.pendingJesterId) {
+    room.pendingJesterId = null;
+    room.pendingJesterVoterIds = [];
+    if (!checkVictoryConditions(room)) startCacadaPhase(room);
+  } else if (room.phase === 'NOITE_ZERO') startCacadaPhase(room);
+  else if (room.phase === 'CACADA') startBadaladaPhase(room);
+  else if (room.phase === 'BADALADA') resolveDancaDosSelos(room);
+  else if (room.phase === 'DANCA_DOS_SELOS') startTribunalPhase(room);
+  else if (room.phase === 'TRIBUNAL') resolveTribunalVotes(room);
+}
+
+function runRoomOperation(code: string, action: (room: RoomState | undefined) => void, sender?: WebSocket, advance = true): Promise<void> {
+  const task = operationQueue.then(async () => {
+    outbox = [];
+    changedRooms = new Set();
+    socketsToReplace = new Set();
+    const previousContexts = new Map([...clients].map(([socket, context]) => [socket, { ...context }]));
+    try {
+      await db.transaction(async tx => {
+        await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${code}))`);
+        const [saved] = await tx.select().from(gameRooms).where(eq(gameRooms.code, code));
+        const room = saved ? hydrateRoom(code, saved.state) : undefined;
+        if (!saved) rooms.delete(code);
+        if (room && advance) advanceExpiredPhase(room);
+        action(room);
+        const current = rooms.get(code);
+        if (current) {
+          const snapshot = JSON.parse(JSON.stringify(current, (key, value) =>
+            key === 'ws' || key === 'phaseTimer' ? null : typeof value === 'string' ? toDatabaseText(value) : value
+          ));
+          await tx.insert(gameRooms).values({ code, state: snapshot, updatedAt: new Date() })
+            .onConflictDoUpdate({ target: gameRooms.code, set: { state: snapshot, updatedAt: new Date() } });
+        }
+      });
+      // Closing another session cannot be rolled back: wait for a durable commit.
+      for (const socket of socketsToReplace) {
+        clients.delete(socket);
+        socket.close(4001, 'Session replaced');
+      }
+      const messages = outbox;
+      outbox = null;
+      for (const { ws, message } of messages) sendToWs(ws, message);
+      for (const roomCode of changedRooms) {
+        const room = rooms.get(roomCode);
+        if (!room) continue;
+        for (const player of room.players) {
+          if (player.ws) sendToWs(player.ws, { type: 'SYNC', payload: {
+            publicState: buildPublicStateForViewer(room, player),
+            privateState: buildPrivateStateForViewer(room, player),
+          } });
+        }
+      }
+    } catch {
+      for (const [socket, previous] of previousContexts) { const context = clients.get(socket); if (context) Object.assign(context, previous); }
+      outbox = null;
+      const room = rooms.get(code);
+      if (room?.phaseTimer) clearTimeout(room.phaseTimer);
+      rooms.delete(code);
+      sendToWs(sender ?? null, { type: 'ERROR', message: 'Não foi possível salvar a partida. Tente novamente em instantes.' });
+      console.error('Não foi possível concluir a atualização da sala.');
+    } finally {
+      outbox = null;
+      socketsToReplace.clear();
+      if (![...clients.values()].some(context => context.roomCode === code)) {
+        const cached = rooms.get(code);
+        if (cached?.phaseTimer) clearTimeout(cached.phaseTimer);
+        rooms.delete(code);
+      }
+    }
+  });
+  operationQueue = task.catch(() => {});
+  return task;
+}
+
 
 function uid(prefix = 'id'): string {
-  return `${prefix}_${Math.random().toString(36).slice(2, 10)}`;
+  return `${prefix}_${randomUUID()}`;
 }
 
 function generateRoomCode(): string {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   let code = '';
   for (let i = 0; i < 4; i++) {
-    code += chars[Math.floor(Math.random() * chars.length)];
+    code += chars[randomInt(chars.length)];
   }
   return rooms.has(code) ? generateRoomCode() : code;
 }
@@ -171,6 +297,7 @@ function clearPhaseTimer(room: RoomState): void {
 }
 
 function sendToWs(ws: WebSocket | null, msg: ServerMessage): void {
+  if (outbox) { outbox.push({ ws, message: msg }); return; }
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(msg));
   }
@@ -235,7 +362,11 @@ function buildPublicStateForViewer(room: RoomState, viewer: ServerPlayer): Publi
     votes: room.votes,
     pendingJesterId: room.pendingJesterId,
     pendingJesterVoterIds: room.pendingJesterVoterIds,
-    activeDuel: room.activeDuel,
+    activeDuel: room.activeDuel && (viewer.id === room.activeDuel.pirateId || viewer.id === room.activeDuel.targetId) ? {
+      ...room.activeDuel,
+      piratePick: viewer.id === room.activeDuel.pirateId ? room.activeDuel.piratePick : null,
+      targetPick: viewer.id === room.activeDuel.targetId ? room.activeDuel.targetPick : null,
+    } : null,
     jailedPlayerId:
       room.jailedPlayerId === viewer.id || room.jailorPlayerId === viewer.id
         ? room.jailedPlayerId
@@ -283,7 +414,7 @@ function buildPrivateStateForViewer(room: RoomState, viewer: ServerPlayer): Priv
     usedRoundAction: viewer.usedRoundAction,
     usedOncePerGame: viewer.usedOncePerGame,
     mafiaPartners,
-    mafiaSealUsedThisRound: room.mafiaSealUsedThisRound,
+    mafiaSealUsedThisRound: isMafia ? room.mafiaSealUsedThisRound : 0,
     mafiaSealLimitThisRound: getMafiaSealLimit(room),
     linkedTargetId: linkedPlayer ? linkedPlayer.id : null,
     linkedTargetName: linkedPlayer ? linkedPlayer.name : null,
@@ -291,10 +422,10 @@ function buildPrivateStateForViewer(room: RoomState, viewer: ServerPlayer): Priv
     usedGhostWhisper: viewer.usedGhostWhisper,
     secretNotes: viewer.secretNotes,
     tribunalChat: room.tribunalChat,
-    mafiaChat: isMafia ? room.mafiaChat : [],
-    mediumChat: canSeeMedium ? room.mediumChat : [],
+    mafiaChat: isMafia && viewer.alive ? room.mafiaChat : [],
+    mediumChat: canSeeMedium ? room.mediumChat.map(message => message.senderAlias === 'O Médium' ? { ...message, senderId: 'medium' } : message) : [],
     ghostChat: canSeeGhosts ? room.ghostChat : [],
-    dungeonChat: canSeeDungeon ? room.dungeonChat : [],
+    dungeonChat: canSeeDungeon ? room.dungeonChat.map(message => message.senderAlias === 'Carcereiro' ? { ...message, senderId: 'jailor' } : message) : [],
     mediumRevealedIdentity: viewer.mediumRevealedIdentity,
     urnSubmitted: viewer.urnSubmitted,
     urnQueuedSlip:
@@ -307,13 +438,10 @@ function buildPrivateStateForViewer(room: RoomState, viewer: ServerPlayer): Priv
 }
 
 function broadcastRoom(room: RoomState): void {
-  for (const player of room.players) {
-    const payload: RoomSyncPayload = {
-      publicState: buildPublicStateForViewer(room, player),
-      privateState: buildPrivateStateForViewer(room, player),
-    };
-    sendToWs(player.ws, { type: 'SYNC', payload });
+  for (const chat of [room.tribunalChat, room.mafiaChat, room.mediumChat, room.ghostChat, room.dungeonChat]) {
+    if (chat.length > 150) chat.splice(0, chat.length - 150);
   }
+  changedRooms.add(room.roomCode);
 }
 
 function computeDeckPreview(room: RoomState): RoleId[] {
@@ -382,8 +510,7 @@ function checkVictoryConditions(room: RoomState): boolean {
     winHeadline = `Vitória dos Matadores Neutros (${names})!`;
   } else if (
     livingMafia.length > 0 &&
-    livingMafia.length * 2 >= living.length &&
-    livingNeutralKillers.length === 0
+    livingMafia.length * 2 >= living.length
   ) {
     winningFactions = ['MAFIA'];
     winHeadline = 'Vitória da Máfia! Os mafiosos dominaram a cidade.';
@@ -420,7 +547,7 @@ function checkVictoryConditions(room: RoomState): boolean {
   const winners = new Set<string>();
   for (const p of room.players) {
     if (p.individualWin) winners.add(p.id);
-    if (p.roleId && winningFactions.includes(ROLES[p.roleId].faction)) {
+    if (p.roleId && winningFactions.includes(ROLES[p.roleId].faction) && (ROLES[p.roleId].faction !== 'NEUTRO_MATADOR' || p.alive)) {
       winners.add(p.id);
     }
   }
@@ -476,7 +603,7 @@ function startCacadaPhase(room: RoomState): void {
   if (room.cacadaMinutes > 0) {
     const durationMs = room.cacadaMinutes * 60 * 1000;
     room.phaseEndsAt = Date.now() + durationMs;
-    room.phaseTimer = setTimeout(() => {
+    room.phaseTimer = scheduleRoomTimer(room, () => {
       if (room.phase === 'CACADA') {
         startBadaladaPhase(room);
       }
@@ -502,7 +629,7 @@ function startBadaladaPhase(room: RoomState): void {
   // 25s automatic window for Urna anonymous submission
   const durationMs = 25_000;
   room.phaseEndsAt = Date.now() + durationMs;
-  room.phaseTimer = setTimeout(() => {
+  room.phaseTimer = scheduleRoomTimer(room, () => {
     if (room.phase === 'BADALADA') {
       resolveDancaDosSelos(room);
     }
@@ -615,6 +742,13 @@ function resolveDancaDosSelos(room: RoomState): void {
     }
   }
 
+  // An activated vest is spent for this bell, including a night without attacks.
+  for (const p of room.players) {
+    if (p.alive && p.vestActivated && !p.blockedThisRound && p.roleId === 'sobrevivente' && (p.slips.vest ?? 0) > 0) {
+      p.slips.vest = (p.slips.vest ?? 0) - 1;
+    } else p.vestActivated = false;
+  }
+
   // 2. Dança dos Selos: evaluate marks on living players
   for (const p of room.players) {
     if (!p.alive) {
@@ -631,8 +765,7 @@ function resolveDancaDosSelos(room: RoomState): void {
     const isAttacked = hasRed || hasBlack || hasFire;
 
     if (isAttacked) {
-      if (p.vestActivated && p.roleId === 'sobrevivente' && (p.slips.vest || 0) > 0) {
-        p.slips.vest = (p.slips.vest || 0) - 1;
+      if (p.vestActivated && p.roleId === 'sobrevivente') {
         const msg = `COLETE! ${p.name} gritou COLETE e sobreviveu aos ataques da Badalada!`;
         announcements.push(msg);
         addChronicle(room, msg, 'info');
@@ -728,6 +861,9 @@ function resolveDancaDosSelos(room: RoomState): void {
   }
 
   room.lastBellAnnouncements = announcements;
+  for (const player of room.players) { player.blockedThisRound = false; player.jailedThisRound = false; }
+  room.jailedPlayerId = null;
+  room.jailorPlayerId = null;
 
   // Convert Carrasco / Anjo if their target died outside Tribunal
   for (const deadId of newlyDeadIds) {
@@ -739,7 +875,7 @@ function resolveDancaDosSelos(room: RoomState): void {
   // Show Dança dos Selos results briefly, then move to Tribunal
   const durationMs = 10_000;
   room.phaseEndsAt = Date.now() + durationMs;
-  room.phaseTimer = setTimeout(() => {
+  room.phaseTimer = scheduleRoomTimer(room, () => {
     if (room.phase === 'DANCA_DOS_SELOS') {
       startTribunalPhase(room);
     }
@@ -768,7 +904,7 @@ function startTribunalPhase(room: RoomState): void {
   if (room.tribunalMinutes > 0) {
     const durationMs = room.tribunalMinutes * 60 * 1000;
     room.phaseEndsAt = Date.now() + durationMs;
-    room.phaseTimer = setTimeout(() => {
+    room.phaseTimer = scheduleRoomTimer(room, () => {
       if (room.phase === 'TRIBUNAL') {
         resolveTribunalVotes(room);
       }
@@ -883,7 +1019,7 @@ function resolveTribunalVotes(room: RoomState): void {
   if (triggeredJester) {
     // Wait up to 20s for Bobo da Corte to pick 1 voter to drag into Ghost status
     room.phaseEndsAt = Date.now() + 20_000;
-    room.phaseTimer = setTimeout(() => {
+    room.phaseTimer = scheduleRoomTimer(room, () => {
       if (room.pendingJesterId) {
         room.pendingJesterId = null;
         room.pendingJesterVoterIds = [];
@@ -900,13 +1036,14 @@ function resolveTribunalVotes(room: RoomState): void {
   startCacadaPhase(room);
 }
 
-function createPlayer(name: string, token: string, seatIndex: number, isHost: boolean, ws: WebSocket): ServerPlayer {
+function createPlayer(name: string, token: string, seatIndex: number, isHost: boolean, ws: WebSocket | null): ServerPlayer {
   return {
     id: uid('pl'),
     token,
-    name: name.trim().slice(0, 24) || 'Convidado',
+    name: cleanGameText(name, 24) || 'Convidado',
     seatIndex,
     connected: true,
+    lastSeenAt: Date.now(),
     isHost,
     alive: true,
     deathCause: null,
@@ -939,10 +1076,11 @@ function createPlayer(name: string, token: string, seatIndex: number, isHost: bo
   };
 }
 
-function handleClientAction(ws: WebSocket, msg: ClientActionMessage, clientContext: { roomCode: string | null; playerId: string | null }): void {
+function handleClientAction(ws: WebSocket, msg: ClientActionMessage, clientContext: ClientContext, newRoomCode?: string): void {
   if (msg.type === 'CREATE_ROOM') {
-    const code = generateRoomCode();
-    const token = msg.playerToken || uid('tok');
+    const code = newRoomCode ?? generateRoomCode();
+    if (rooms.has(code)) throw new Error("Room collision");
+    const token = createHash('sha256').update(msg.playerToken!).digest('hex');
     const host = createPlayer(msg.name, token, 0, true, ws);
     const room: RoomState = {
       roomCode: code,
@@ -993,17 +1131,22 @@ function handleClientAction(ws: WebSocket, msg: ClientActionMessage, clientConte
       sendToWs(ws, { type: 'ERROR', message: `Sala "${code}" não encontrada.` });
       return;
     }
+    const requestedName = cleanGameText(msg.name, 24);
 
     // Check reconnection by token
     const existing = msg.playerToken
-      ? room.players.find((p) => p.token === msg.playerToken)
+      ? room.players.find((p) => p.token === createHash('sha256').update(msg.playerToken!).digest('hex'))
       : undefined;
 
     if (existing) {
+      if (existing.ws && existing.ws !== ws) {
+        socketsToReplace.add(existing.ws);
+      }
       existing.ws = ws;
       existing.connected = true;
-      if (msg.name.trim()) {
-        existing.name = msg.name.trim().slice(0, 24);
+      existing.lastSeenAt = Date.now();
+      if (requestedName) {
+        existing.name = requestedName;
       }
       clientContext.roomCode = code;
       clientContext.playerId = existing.id;
@@ -1022,13 +1165,13 @@ function handleClientAction(ws: WebSocket, msg: ClientActionMessage, clientConte
     }
 
     const duplicateName = room.players.some(
-      (p) => p.name.toLowerCase() === msg.name.trim().toLowerCase()
+      (p) => p.name.toLowerCase() === requestedName.toLowerCase()
     );
     const cleanName = duplicateName
-      ? `${msg.name.trim().slice(0, 20)} ${room.players.length + 1}`
-      : msg.name.trim().slice(0, 24);
+      ? `${cleanGameText(requestedName, 20)} ${room.players.length + 1}`
+      : requestedName;
 
-    const token = msg.playerToken || uid('tok');
+    const token = createHash('sha256').update(msg.playerToken!).digest('hex');
     const newPlayer = createPlayer(cleanName, token, room.players.length, false, ws);
     room.players.push(newPlayer);
     room.publicRoleList = computeDeckPreview(room);
@@ -1046,9 +1189,48 @@ function handleClientAction(ws: WebSocket, msg: ClientActionMessage, clientConte
   const room = rooms.get(clientContext.roomCode);
   if (!room) return;
   const player = room.players.find((p) => p.id === clientContext.playerId);
-  if (!player) return;
+  if (!player || player.ws !== ws) return;
+  player.lastSeenAt = Date.now();
+
+  if (msg.type === 'SYNC_REQUEST') {
+    sendToWs(ws, { type: 'SYNC', payload: {
+      publicState: buildPublicStateForViewer(room, player),
+      privateState: buildPrivateStateForViewer(room, player),
+    } });
+    return;
+  }
+
+  if (msg.type === 'LEAVE_ROOM') {
+    player.ws = null;
+    player.connected = false;
+    if (room.phase === 'LOBBY') {
+      room.players = room.players.filter(p => p.id !== player.id);
+      room.players.sort((a, b) => a.seatIndex - b.seatIndex).forEach((p, index) => { p.seatIndex = index; });
+      room.publicRoleList = computeDeckPreview(room);
+    }
+    if (player.isHost) {
+      player.isHost = false;
+      const nextHost = room.players.find(p => p.connected) ?? room.players[0];
+      if (nextHost) nextHost.isHost = true;
+    }
+    clientContext.roomCode = null;
+    clientContext.playerId = null;
+    sendToWs(ws, { type: 'LEFT' });
+    broadcastRoom(room);
+    return;
+  }
 
   switch (msg.type) {
+    case 'KICK_PLAYER': {
+      if (!player.isHost || room.phase !== 'LOBBY') return;
+      const target = room.players.find(p => p.id === msg.playerId);
+      if (!target || target.connected || target.id === player.id) return;
+      room.players = room.players.filter(p => p.id !== target.id);
+      room.players.sort((a, b) => a.seatIndex - b.seatIndex).forEach((p, index) => { p.seatIndex = index; });
+      room.publicRoleList = computeDeckPreview(room);
+      broadcastRoom(room);
+      return;
+    }
     case 'REORDER_SEAT': {
       if (!player.isHost || room.phase !== 'LOBBY') return;
       const sorted = [...room.players].sort((a, b) => a.seatIndex - b.seatIndex);
@@ -1075,11 +1257,14 @@ function handleClientAction(ws: WebSocket, msg: ClientActionMessage, clientConte
 
     case 'UPDATE_SETTINGS': {
       if (!player.isHost || room.phase !== 'LOBBY') return;
-      if (msg.deckMode) room.deckMode = msg.deckMode;
-      if (msg.customDeck) room.customDeck = msg.customDeck;
-      if (typeof msg.cacadaMinutes === 'number') room.cacadaMinutes = msg.cacadaMinutes;
-      if (typeof msg.tribunalMinutes === 'number') room.tribunalMinutes = msg.tribunalMinutes;
-      if (msg.killerPace) room.killerPace = msg.killerPace;
+      if (msg.deckMode && ['classic', 'categories', 'free'].includes(msg.deckMode)) {
+        if (msg.deckMode === 'free' && room.deckMode !== 'free') room.customDeck = [...room.publicRoleList];
+        room.deckMode = msg.deckMode;
+      }
+      if (msg.customDeck && msg.customDeck.length <= 20 && msg.customDeck.every(id => ROLES[id] && msg.customDeck!.filter(role => role === id).length <= ROLES[id].maxCopies)) room.customDeck = msg.customDeck;
+      if ([0, 3, 5, 10, 15, 30].includes(msg.cacadaMinutes!)) room.cacadaMinutes = msg.cacadaMinutes!;
+      if ([0, 1, 2, 3, 5, 10].includes(msg.tribunalMinutes!)) room.tribunalMinutes = msg.tribunalMinutes!;
+      if (msg.killerPace && ['normal', 'fast', 'slow'].includes(msg.killerPace)) room.killerPace = msg.killerPace;
       if (typeof msg.hideBackMarksUntilBell === 'boolean') {
         room.hideBackMarksUntilBell = msg.hideBackMarksUntilBell;
       }
@@ -1098,7 +1283,8 @@ function handleClientAction(ws: WebSocket, msg: ClientActionMessage, clientConte
         return;
       }
 
-      const deck = computeDeckPreview(room);
+      if (room.players.some(p => !p.connected)) { sendToWs(ws, { type: 'ERROR', message: 'Aguarde a reconexão dos convidados ou remova quem saiu antes de começar.' }); return; }
+      const deck = [...room.publicRoleList];
       if (deck.length !== room.players.length) {
         sendToWs(ws, {
           type: 'ERROR',
@@ -1168,7 +1354,7 @@ function handleClientAction(ws: WebSocket, msg: ClientActionMessage, clientConte
 
       const durationMs = 45_000;
       room.phaseEndsAt = Date.now() + durationMs;
-      room.phaseTimer = setTimeout(() => {
+      room.phaseTimer = scheduleRoomTimer(room, () => {
         if (room.phase === 'NOITE_ZERO') {
           startCacadaPhase(room);
         }
@@ -1179,7 +1365,7 @@ function handleClientAction(ws: WebSocket, msg: ClientActionMessage, clientConte
     }
 
     case 'ADVANCE_PHASE': {
-      if (!player.isHost) return;
+      if (!player.isHost || room.pendingJesterId) return;
       if (room.phase === 'NOITE_ZERO') startCacadaPhase(room);
       else if (room.phase === 'CACADA') startBadaladaPhase(room);
       else if (room.phase === 'BADALADA') resolveDancaDosSelos(room);
@@ -1189,7 +1375,7 @@ function handleClientAction(ws: WebSocket, msg: ClientActionMessage, clientConte
     }
 
     case 'TOGGLE_READY': {
-      if (room.phase === 'LOBBY' || room.phase === 'FIM_DE_JOGO') return;
+      if (room.phase === 'LOBBY' || room.phase === 'FIM_DE_JOGO' || !player.alive || room.pendingJesterId) return;
       player.readyForNext = !player.readyForNext;
       const living = room.players.filter((p) => p.alive);
       if (living.length > 0 && living.every((p) => p.readyForNext)) {
@@ -1212,7 +1398,7 @@ function handleClientAction(ws: WebSocket, msg: ClientActionMessage, clientConte
     case 'APPLY_STICKER': {
       if (room.phase !== 'CACADA' || !player.alive || !player.roleId) return;
       const target = room.players.find((t) => t.id === msg.targetId && t.alive);
-      if (!target) return;
+      if (!target || target.id === player.id || player.blockedThisRound) return;
 
       if (msg.sticker === 'orange_deco') {
         if (player.usedOrangeThisRound) {
@@ -1381,7 +1567,7 @@ function handleClientAction(ws: WebSocket, msg: ClientActionMessage, clientConte
         p.backMarks = p.backMarks.filter(
           (m) => !(m.placedBy === target.id && m.roundPlaced === room.round && m.sticker !== 'orange_deco')
         );
-        if (p.backMarks.length < before && target.roleId === 'chefao' || p.backMarks.length < before && target.roleId === 'mafioso') {
+        if (p.backMarks.length < before && (target.roleId === 'chefao' || target.roleId === 'mafioso')) {
           room.mafiaSealUsedThisRound = Math.max(0, room.mafiaSealUsedThisRound - 1);
         }
       }
@@ -1548,11 +1734,15 @@ function handleClientAction(ws: WebSocket, msg: ClientActionMessage, clientConte
     }
 
     case 'DUEL_PICK': {
+      if (!player.alive || room.phase !== 'CACADA') return;
       const duel = room.activeDuel;
       if (!duel || duel.id !== msg.duelId || duel.finished) return;
+      if (!['pedra', 'papel', 'tesoura'].includes(msg.pick)) return;
       if (player.id === duel.pirateId) {
+        if (duel.piratePick) return;
         duel.piratePick = msg.pick;
       } else if (player.id === duel.targetId) {
+        if (duel.targetPick) return;
         duel.targetPick = msg.pick;
       } else {
         return;
@@ -1584,6 +1774,7 @@ function handleClientAction(ws: WebSocket, msg: ClientActionMessage, clientConte
 
         if (duel.pirateScore >= 2 || duel.targetScore >= 2) {
           duel.finished = true;
+          duel.finishedAt = Date.now();
           duel.winnerId = duel.pirateScore >= 2 ? duel.pirateId : duel.targetId;
           const pirate = room.players.find((p) => p.id === duel.pirateId);
           if (duel.winnerId === duel.pirateId && pirate) {
@@ -1602,12 +1793,6 @@ function handleClientAction(ws: WebSocket, msg: ClientActionMessage, clientConte
               );
             }
           }
-          setTimeout(() => {
-            if (room.activeDuel && room.activeDuel.id === duel.id) {
-              room.activeDuel = null;
-              broadcastRoom(room);
-            }
-          }, 4000);
         }
       }
       broadcastRoom(room);
@@ -1615,7 +1800,7 @@ function handleClientAction(ws: WebSocket, msg: ClientActionMessage, clientConte
     }
 
     case 'URN_SUBMIT': {
-      if (room.phase !== 'BADALADA' || !player.alive) return;
+      if (room.phase !== 'BADALADA' || !player.alive || player.urnSubmitted) return;
       if (msg.slip !== 'blank' && !player.blockedThisRound) {
         if (msg.slip === 'match' && player.roleId === 'incendiario' && (player.slips.match || 0) > 0) {
           player.urnQueuedSlip = 'match';
@@ -1624,7 +1809,7 @@ function handleClientAction(ws: WebSocket, msg: ClientActionMessage, clientConte
           msg.slip === 'bullet' &&
           player.roleId === 'justiceiro' &&
           (player.slips.bullet || 0) > 0 &&
-          msg.targetId
+          msg.targetId && room.players.some(p => p.id === msg.targetId && p.alive && p.id !== player.id)
         ) {
           player.urnQueuedSlip = 'bullet';
           player.urnQueuedTargetId = msg.targetId;
@@ -1636,6 +1821,9 @@ function handleClientAction(ws: WebSocket, msg: ClientActionMessage, clientConte
         ) {
           player.urnQueuedSlip = 'execution';
           player.urnQueuedTargetId = room.jailedPlayerId;
+        } else if (msg.slip === 'silence' && player.roleId === 'chantagista' && (player.slips.silence || 0) > 0 && msg.targetId && room.players.some(p => p.id === msg.targetId && p.alive && p.id !== player.id)) {
+          player.urnQueuedSlip = 'silence';
+          player.urnQueuedTargetId = msg.targetId;
         }
       } else if (msg.slip === 'blank') {
         if (player.urnQueuedSlip === null) {
@@ -1669,7 +1857,8 @@ function handleClientAction(ws: WebSocket, msg: ClientActionMessage, clientConte
     }
 
     case 'CAST_VOTE': {
-      if (room.phase !== 'TRIBUNAL' || !player.alive) return;
+      if (room.phase !== 'TRIBUNAL' || !player.alive || room.pendingJesterId) return;
+      if (msg.targetId !== 'SKIP' && !room.players.some(p => p.id === msg.targetId && p.alive && p.id !== player.id)) return;
       if (room.votes[player.id] === msg.targetId) {
         delete room.votes[player.id];
       } else {
@@ -1710,7 +1899,7 @@ function handleClientAction(ws: WebSocket, msg: ClientActionMessage, clientConte
     case 'GHOST_WHISPER': {
       if (player.alive || player.usedGhostWhisper) return;
       const target = room.players.find((t) => t.id === msg.targetId && t.alive);
-      const cleanText = msg.message.trim().slice(0, 140);
+      const cleanText = cleanGameText(msg.message, 140);
       if (!target || !cleanText) return;
 
       player.usedGhostWhisper = true;
@@ -1746,10 +1935,11 @@ function handleClientAction(ws: WebSocket, msg: ClientActionMessage, clientConte
     }
 
     case 'SEND_CHAT': {
-      const text = msg.text.trim().slice(0, 220);
+      const text = cleanGameText(msg.text, 220);
       if (!text) return;
 
       if (msg.channel === 'TRIBUNAL') {
+        if (room.phase !== 'TRIBUNAL' || room.pendingJesterId) return;
         if (!player.alive || player.silenced) return;
         room.tribunalChat.push({
           id: uid('msg'),
@@ -1760,7 +1950,7 @@ function handleClientAction(ws: WebSocket, msg: ClientActionMessage, clientConte
           timestamp: Date.now(),
         });
       } else if (msg.channel === 'MAFIA') {
-        if (!player.roleId || ROLES[player.roleId].faction !== 'MAFIA') return;
+        if (!player.alive || !player.roleId || ROLES[player.roleId].faction !== 'MAFIA') return;
         room.mafiaChat.push({
           id: uid('msg'),
           channel: 'MAFIA',
@@ -1796,6 +1986,7 @@ function handleClientAction(ws: WebSocket, msg: ClientActionMessage, clientConte
           timestamp: Date.now(),
         });
       } else if (msg.channel === 'DUNGEON') {
+        if (!player.alive || room.phase !== 'CACADA' || !room.jailedPlayerId) return;
         if (player.id !== room.jailorPlayerId && player.id !== room.jailedPlayerId) return;
         const alias =
           player.id === room.jailorPlayerId
@@ -1816,7 +2007,7 @@ function handleClientAction(ws: WebSocket, msg: ClientActionMessage, clientConte
     }
 
     case 'PLAY_AGAIN': {
-      if (!player.isHost) return;
+      if (!player.isHost || room.phase !== 'FIM_DE_JOGO') return;
       clearPhaseTimer(room);
       room.phase = 'LOBBY';
       room.round = 0;
@@ -1826,22 +2017,23 @@ function handleClientAction(ws: WebSocket, msg: ClientActionMessage, clientConte
       room.activeDuel = null;
       room.jailedPlayerId = null;
       room.jailorPlayerId = null;
+      room.mafiaSealUsedThisRound = 0;
+      room.pendingReviveTargetId = null;
+      room.pendingReviveCasterId = null;
+      room.marshalDoubleElimination = false;
+      room.tribunalChat = [];
+      room.mafiaChat = [];
+      room.mediumChat = [];
+      room.ghostChat = [];
+      room.dungeonChat = [];
       room.chronicle = [];
       room.lastBellAnnouncements = [];
       room.winningFactions = [];
       room.winnerPlayerIds = [];
       room.winHeadline = null;
       for (const p of room.players) {
-        p.alive = true;
-        p.deathCause = null;
-        p.revealedPublicly = false;
-        p.roleId = null;
-        p.originalRoleId = null;
-        p.backMarks = [];
-        p.secretNotes = [];
-        p.silenced = false;
-        p.readyForNext = false;
-        p.individualWin = false;
+        const reset = createPlayer(p.name, p.token, p.seatIndex, p.isHost, p.ws);
+        Object.assign(p, reset, { id: p.id, connected: p.connected, lastSeenAt: p.lastSeenAt });
       }
       room.publicRoleList = computeDeckPreview(room);
       broadcastRoom(room);
@@ -1850,65 +2042,143 @@ function handleClientAction(ws: WebSocket, msg: ClientActionMessage, clientConte
   }
 }
 
-async function startServer() {
-  const app = express();
-  const server = http.createServer(app);
-  const wss = new WebSocketServer({ server, path: '/ws' });
+function validMessage(value: unknown): value is ClientActionMessage {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const msg = value as Record<string, unknown>;
+  if (typeof msg.type !== 'string') return false;
+  const text = (field: string, max = 150) => typeof msg[field] === 'string' && msg[field].length <= max && Boolean(cleanGameText(msg[field], max));
+  const choice = (field: string, values: readonly unknown[]) => values.includes(msg[field]);
+  const optionalChoice = (field: string, values: readonly unknown[]) => !(field in msg) || choice(field, values);
 
-  app.get('/api/health', (_req, res) => {
-    res.json({ status: 'ok', rooms: rooms.size });
-  });
-
-  wss.on('connection', (ws) => {
-    const clientContext: { roomCode: string | null; playerId: string | null } = {
-      roomCode: null,
-      playerId: null,
-    };
-
-    ws.on('message', (raw) => {
-      try {
-        const msg = JSON.parse(raw.toString()) as ClientActionMessage;
-        handleClientAction(ws, msg, clientContext);
-      } catch {
-        sendToWs(ws, { type: 'ERROR', message: 'Mensagem inválida.' });
-      }
-    });
-
-    ws.on('close', () => {
-      if (clientContext.roomCode && clientContext.playerId) {
-        const room = rooms.get(clientContext.roomCode);
-        if (room) {
-          const p = room.players.find((x) => x.id === clientContext.playerId);
-          if (p && p.ws === ws) {
-            p.connected = false;
-            p.ws = null;
-            broadcastRoom(room);
-          }
-        }
-      }
-    });
-  });
-
-  const isProd = process.env.NODE_ENV === 'production' && fs.existsSync(path.join(__dirname, 'dist'));
-  if (isProd) {
-    const distDir = path.join(__dirname, 'dist');
-    app.use(express.static(distDir));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.join(distDir, 'index.html'));
-    });
-  } else {
-    const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
+  switch (msg.type) {
+    case 'CREATE_ROOM':
+    case 'JOIN_ROOM':
+      return text('name', 24) && text('playerToken') && (msg.playerToken as string).length >= 20 &&
+        (msg.type === 'CREATE_ROOM' || (text('roomCode', 10) && /^[A-HJ-NP-Z2-9]{4}$/i.test((msg.roomCode as string).trim())));
+    case 'UPDATE_SETTINGS':
+      return optionalChoice('deckMode', ['classic', 'categories', 'free']) &&
+        optionalChoice('killerPace', ['normal', 'fast', 'slow']) &&
+        optionalChoice('cacadaMinutes', [0, 3, 5, 10, 15, 30]) &&
+        optionalChoice('tribunalMinutes', [0, 1, 2, 3, 5, 10]) &&
+        (!('hideBackMarksUntilBell' in msg) || typeof msg.hideBackMarksUntilBell === 'boolean') &&
+        (!('customDeck' in msg) || (Array.isArray(msg.customDeck) && msg.customDeck.length <= 20 &&
+          msg.customDeck.every(id => typeof id === 'string' && Object.hasOwn(ROLES, id))));
+    case 'KICK_PLAYER':
+      return text('playerId');
+    case 'REORDER_SEAT':
+      return text('playerId') && choice('direction', ['up', 'down']);
+    case 'APPLY_STICKER':
+      return text('targetId') && choice('sticker', ['red_seal', 'black_seal', 'blue_drop', 'white_amulet', 'gold_shield', 'orange_deco']);
+    case 'DUEL_PICK':
+      return text('duelId') && choice('pick', ['pedra', 'papel', 'tesoura']);
+    case 'URN_SUBMIT':
+      return choice('slip', ['blank', 'match', 'bullet', 'execution', 'silence']) &&
+        (!('targetId' in msg) || text('targetId'));
+    case 'GHOST_WHISPER':
+      return text('targetId') && text('message', 500);
+    case 'SEND_CHAT':
+      return choice('channel', ['TRIBUNAL', 'MAFIA', 'MEDIUM', 'GHOSTS', 'DUNGEON']) && text('text', 500);
+    case 'INVESTIGATE':
+    case 'BLOCK_PLAYER':
+    case 'JAIL_PLAYER':
+    case 'QUEUE_BULLET':
+    case 'SILENCE_PLAYER':
+    case 'REVIVE_GHOST':
+    case 'CHALLENGE_DUEL':
+    case 'CAST_VOTE':
+    case 'JESTER_REVENGE':
+      return text('targetId');
+    case 'SYNC_REQUEST':
+    case 'LEAVE_ROOM':
+    case 'SHUFFLE_SEATS':
+    case 'START_GAME':
+    case 'ADVANCE_PHASE':
+    case 'TOGGLE_READY':
+    case 'COMPLETE_MISSION':
+    case 'QUEUE_EXECUTION':
+    case 'REVEAL_PUBLIC_ROLE':
+    case 'ACTIVATE_VEST':
+    case 'REVEAL_MEDIUM_TO_GHOSTS':
+    case 'PLAY_AGAIN':
+      return true;
+    default:
+      return false;
   }
-
-  const port = Number(process.env.PORT) || 3000;
-  server.listen(port, '0.0.0.0', () => {
-    console.log(`A Noite das Marcas server running on http://0.0.0.0:${port}`);
-  });
 }
 
-startServer();
+export async function createGameServer({ development = false } = {}) {
+  const app = express();
+  app.disable('x-powered-by');
+  const server = http.createServer(app);
+  const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 8192 });
+
+  app.get('/api/health', (_req, res) => res.json({ status: 'ok' }));
+  wss.on('connection', (ws, request) => {
+    ws.on('error', () => {});
+    // Same-origin browser connections only. Non-browser clients may omit Origin.
+    if (request.headers.origin) {
+      try {
+        const origin = new URL(request.headers.origin);
+        if (!['http:', 'https:'].includes(origin.protocol) || origin.host !== request.headers.host) {
+          ws.close(1008, 'Invalid origin'); return;
+        }
+      } catch { ws.close(1008, 'Invalid origin'); return; }
+    }
+    const context: ClientContext = { roomCode: null, playerId: null };
+    clients.set(ws, context);
+    let windowStarted = Date.now();
+    let messageCount = 0;
+    ws.on('message', raw => {
+      if (Date.now() - windowStarted > 10_000) { windowStarted = Date.now(); messageCount = 0; }
+      if (++messageCount > 80) { ws.close(1008, 'Too many messages'); return; }
+      try {
+        const msg: unknown = JSON.parse(raw.toString());
+        if (!validMessage(msg)) { sendToWs(ws, { type: 'ERROR', message: 'Mensagem inválida.' }); return; }
+        if ((msg.type === 'CREATE_ROOM' || msg.type === 'JOIN_ROOM') && context.roomCode) {
+          sendToWs(ws, { type: 'ERROR', message: 'Saia da sala atual antes de entrar em outra.' }); return;
+        }
+        const code = msg.type === 'CREATE_ROOM' ? generateRoomCode() : msg.type === 'JOIN_ROOM' ? msg.roomCode.trim().toUpperCase() : context.roomCode;
+        if (!code) { sendToWs(ws, { type: 'ERROR', message: 'Entre em uma sala para jogar.' }); return; }
+        void runRoomOperation(code, () => {
+          if (ws.readyState !== WebSocket.OPEN) return;
+          // Context may have changed while this message waited for a database lock.
+          if (msg.type === 'CREATE_ROOM' || msg.type === 'JOIN_ROOM') {
+            if (context.roomCode) {
+              sendToWs(ws, { type: 'ERROR', message: 'Saia da sala atual antes de entrar em outra.' }); return;
+            }
+          } else if (context.roomCode !== code) {
+            sendToWs(ws, { type: 'ERROR', message: 'Entre em uma sala para jogar.' }); return;
+          }
+          handleClientAction(ws, msg, context, code);
+        }, ws);
+      } catch { sendToWs(ws, { type: 'ERROR', message: 'Mensagem inválida.' }); }
+    });
+    ws.on('close', () => {
+      clients.delete(ws);
+      const { roomCode, playerId } = context;
+      if (!roomCode || !playerId) return;
+      void runRoomOperation(roomCode, room => {
+        const player = room?.players.find(p => p.id === playerId);
+        const replacement = [...clients.values()].some(c => c.roomCode === roomCode && c.playerId === playerId);
+        if (room && player && !replacement) {
+          player.connected = false; player.ws = null; broadcastRoom(room);
+        }
+      });
+    });
+  });
+
+  if (development) {
+    const { createServer: createViteServer } = await import('vite');
+    const vite = await createViteServer({ cacheDir: `.netlify/vite-${process.pid}`, server: { middlewareMode: true }, appType: 'spa' });
+    app.use(vite.middlewares);
+  } else {
+    app.use(express.static(path.join(__dirname, 'dist')));
+    app.use((_req, res) => res.status(404).json({ error: 'Not found' }));
+  }
+  return server;
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {
+  const server = await createGameServer({ development: true });
+  server.listen(Number(process.env.PORT) || 3000, '0.0.0.0');
+}
